@@ -77,5 +77,9 @@ jobs:
             exit 0
           fi
 
+          if git show-ref --tags --verify --quiet "refs/tags/${TAG}"; then
+            git tag -d "$TAG"
+          fi
+
           git tag -a "$TAG" -m "Sync upstream release ${TAG}"
           git push origin "refs/tags/${TAG}"
