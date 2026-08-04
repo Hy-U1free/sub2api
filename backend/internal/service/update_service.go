@@ -28,9 +28,10 @@ var (
 )
 
 const (
-	updateCacheKey = "update_check_cache"
-	updateCacheTTL = 1200 // 20 minutes
-	githubRepo     = "Wei-Shaw/sub2api"
+	updateCacheKey              = "update_check_cache"
+	updateCacheTTL              = 1200 // 20 minutes
+	defaultGitHubRepo           = "Wei-Shaw/sub2api"
+	updateGitHubRepositoryEnv   = "UPDATE_GITHUB_REPOSITORY"
 
 	// Security: allowed download domains for updates
 	allowedDownloadHost = "github.com"
@@ -51,7 +52,7 @@ type UpdateCache interface {
 	SetUpdateInfo(ctx context.Context, data string, ttl time.Duration) error
 }
 
-// GitHubReleaseClient 获取 GitHub release 信息的接口
+// GitHubReleaseClient ?? GitHub release ?????
 type GitHubReleaseClient interface {
 	FetchLatestRelease(ctx context.Context, repo string) (*GitHubRelease, error)
 	FetchRecentReleases(ctx context.Context, repo string, perPage int) ([]*GitHubRelease, error)
@@ -61,19 +62,21 @@ type GitHubReleaseClient interface {
 
 // UpdateService handles software updates
 type UpdateService struct {
-	cache          UpdateCache
-	githubClient   GitHubReleaseClient
-	currentVersion string
-	buildType      string // "source" for manual builds, "release" for CI builds
+	cache            UpdateCache
+	githubClient     GitHubReleaseClient
+	currentVersion   string
+	buildType        string // "source" for manual builds, "release" for CI builds
+	updateRepository string
 }
 
 // NewUpdateService creates a new UpdateService
 func NewUpdateService(cache UpdateCache, githubClient GitHubReleaseClient, version, buildType string) *UpdateService {
 	return &UpdateService{
-		cache:          cache,
-		githubClient:   githubClient,
-		currentVersion: version,
-		buildType:      buildType,
+		cache:            cache,
+		githubClient:     githubClient,
+		currentVersion:   version,
+		buildType:        buildType,
+		updateRepository: resolveUpdateRepository(),
 	}
 }
 
@@ -86,6 +89,7 @@ type UpdateInfo struct {
 	Cached         bool         `json:"cached"`
 	Warning        string       `json:"warning,omitempty"`
 	BuildType      string       `json:"build_type"` // "source" or "release"
+	UpdateRepository string       `json:"update_repository"`
 }
 
 // ReleaseInfo contains GitHub release details
@@ -147,11 +151,12 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
 			return cached, nil
 		}
 		return &UpdateInfo{
-			CurrentVersion: s.currentVersion,
-			LatestVersion:  s.currentVersion,
-			HasUpdate:      false,
-			Warning:        err.Error(),
-			BuildType:      s.buildType,
+			CurrentVersion:   s.currentVersion,
+			LatestVersion:    s.currentVersion,
+			HasUpdate:        false,
+			Warning:          err.Error(),
+			BuildType:        s.buildType,
+			UpdateRepository: s.updateRepository,
 		}, nil
 	}
 
@@ -363,7 +368,7 @@ func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) e
 // fetchRollbackCandidates fetches recent releases and keeps the newest
 // maxRollbackVersions entries strictly older than the current version.
 func (s *UpdateService) fetchRollbackCandidates(ctx context.Context) ([]*GitHubRelease, error) {
-	releases, err := s.githubClient.FetchRecentReleases(ctx, githubRepo, rollbackFetchPageSize)
+	releases, err := s.githubClient.FetchRecentReleases(ctx, s.updateRepository, rollbackFetchPageSize)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +405,7 @@ func (s *UpdateService) fetchRollbackCandidates(ctx context.Context) ([]*GitHubR
 }
 
 func (s *UpdateService) fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
-	release, err := s.githubClient.FetchLatestRelease(ctx, githubRepo)
+	release, err := s.githubClient.FetchLatestRelease(ctx, s.updateRepository)
 	if err != nil {
 		return nil, err
 	}
@@ -417,9 +422,10 @@ func (s *UpdateService) fetchLatestRelease(ctx context.Context) (*UpdateInfo, er
 	}
 
 	return &UpdateInfo{
-		CurrentVersion: s.currentVersion,
-		LatestVersion:  latestVersion,
-		HasUpdate:      compareVersions(s.currentVersion, latestVersion) < 0,
+		CurrentVersion:   s.currentVersion,
+		LatestVersion:    latestVersion,
+		HasUpdate:        compareVersions(s.currentVersion, latestVersion) < 0,
+		UpdateRepository: s.updateRepository,
 		ReleaseInfo: &ReleaseInfo{
 			Name:        release.Name,
 			Body:        release.Body,
@@ -600,12 +606,17 @@ func (s *UpdateService) getFromCache(ctx context.Context) (*UpdateInfo, error) {
 	}
 
 	var cached struct {
-		Latest      string       `json:"latest"`
-		ReleaseInfo *ReleaseInfo `json:"release_info"`
-		Timestamp   int64        `json:"timestamp"`
+		Latest           string       `json:"latest"`
+		ReleaseInfo      *ReleaseInfo `json:"release_info"`
+		Timestamp        int64        `json:"timestamp"`
+		UpdateRepository string       `json:"update_repository"`
 	}
 	if err := json.Unmarshal([]byte(data), &cached); err != nil {
 		return nil, err
+	}
+
+	if cached.UpdateRepository != s.updateRepository {
+		return nil, fmt.Errorf("cached update repository mismatch")
 	}
 
 	if time.Now().Unix()-cached.Timestamp > updateCacheTTL {
@@ -613,28 +624,63 @@ func (s *UpdateService) getFromCache(ctx context.Context) (*UpdateInfo, error) {
 	}
 
 	return &UpdateInfo{
-		CurrentVersion: s.currentVersion,
-		LatestVersion:  cached.Latest,
-		HasUpdate:      compareVersions(s.currentVersion, cached.Latest) < 0,
-		ReleaseInfo:    cached.ReleaseInfo,
-		Cached:         true,
-		BuildType:      s.buildType,
+		CurrentVersion:   s.currentVersion,
+		LatestVersion:    cached.Latest,
+		HasUpdate:        compareVersions(s.currentVersion, cached.Latest) < 0,
+		ReleaseInfo:      cached.ReleaseInfo,
+		Cached:           true,
+		BuildType:        s.buildType,
+		UpdateRepository: s.updateRepository,
 	}, nil
 }
 
 func (s *UpdateService) saveToCache(ctx context.Context, info *UpdateInfo) {
 	cacheData := struct {
-		Latest      string       `json:"latest"`
-		ReleaseInfo *ReleaseInfo `json:"release_info"`
-		Timestamp   int64        `json:"timestamp"`
+		Latest           string       `json:"latest"`
+		ReleaseInfo      *ReleaseInfo `json:"release_info"`
+		Timestamp        int64        `json:"timestamp"`
+		UpdateRepository string       `json:"update_repository"`
 	}{
-		Latest:      info.LatestVersion,
-		ReleaseInfo: info.ReleaseInfo,
-		Timestamp:   time.Now().Unix(),
+		Latest:           info.LatestVersion,
+		ReleaseInfo:      info.ReleaseInfo,
+		Timestamp:        time.Now().Unix(),
+		UpdateRepository: s.updateRepository,
 	}
 
 	data, _ := json.Marshal(cacheData)
 	_ = s.cache.SetUpdateInfo(ctx, string(data), time.Duration(updateCacheTTL)*time.Second)
+}
+
+func resolveUpdateRepository() string {
+	repo := strings.TrimSpace(os.Getenv(updateGitHubRepositoryEnv))
+	if isValidGitHubRepository(repo) {
+		return repo
+	}
+	return defaultGitHubRepo
+}
+
+func isValidGitHubRepository(repo string) bool {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	return isValidGitHubRepositoryPart(parts[0]) && isValidGitHubRepositoryPart(parts[1])
+}
+
+func isValidGitHubRepositoryPart(part string) bool {
+	if part == "" {
+		return false
+	}
+	for _, r := range part {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // compareVersions compares two semantic versions

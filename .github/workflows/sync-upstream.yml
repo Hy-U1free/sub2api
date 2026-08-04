@@ -1,0 +1,81 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release_tag:
+        description: 'Create the latest upstream release tag in this fork after a clean merge'
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Wei-Shaw/sub2api.git
+          git fetch upstream main --tags
+
+      - name: Merge upstream main
+        run: git merge --no-edit upstream/main
+
+      - name: Push merged main
+        run: |
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          if git diff --quiet "origin/${DEFAULT_BRANCH}" HEAD; then
+            echo "No upstream changes to push."
+          else
+            git push origin "HEAD:${DEFAULT_BRANCH}"
+          fi
+
+      - name: Read latest upstream release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api repos/Wei-Shaw/sub2api/releases/latest --jq '.tag_name')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "No latest upstream release tag found."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create fork release tag
+        env:
+          CREATE_RELEASE_TAG: ${{ github.event_name == 'schedule' || inputs.create_release_tag }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          if [ "$CREATE_RELEASE_TAG" != "true" ]; then
+            echo "Release tag creation disabled for this run."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Fork already has ${TAG}; no release tag needed."
+            exit 0
+          fi
+
+          git tag -a "$TAG" -m "Sync upstream release ${TAG}"
+          git push origin "refs/tags/${TAG}"
