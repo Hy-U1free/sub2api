@@ -37,7 +37,7 @@ jobs:
       - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/Wei-Shaw/sub2api.git
-          git fetch upstream main --tags
+          git fetch upstream main
 
       - name: Merge upstream main
         run: git merge --no-edit upstream/main
